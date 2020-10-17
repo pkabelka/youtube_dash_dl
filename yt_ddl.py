@@ -102,69 +102,85 @@ async def fetch(session, url, i, pbar, sem):
         return resp
 
 async def get_segments(total_segments, video_base, audio_base):
-    pbar = tqdm(total=2*len(total_segments), desc="Downloading segments")
+    if video_base and audio_base:
+        total_seg = 2*len(total_segments)
+    else:
+        total_seg = len(total_segments)
+    pbar = tqdm(total=total_seg, desc="Downloading segments")
     async with aiohttp.ClientSession() as session:
         sem = asyncio.Semaphore(12)
         tasks = []
         for i in total_segments:
-            tasks.append(asyncio.create_task(fetch(session, f"{video_base}{i}", i, pbar, sem)))
-            tasks.append(asyncio.create_task(fetch(session, f"{audio_base}{i}", i, pbar, sem)))
+            if video_base:
+                tasks.append(asyncio.create_task(fetch(session, f"{video_base}{i}", i, pbar, sem)))
+            if audio_base:
+                tasks.append(asyncio.create_task(fetch(session, f"{audio_base}{i}", i, pbar, sem)))
         res = await asyncio.gather(*tasks)
     pbar.close()
-    video_file = io.BytesIO()
-    audio_file = io.BytesIO()
-    for i in range(0, len(res), 2):
-        video_file.write(res[i])
-        audio_file.write(res[i+1])
-    return video_file, audio_file
+    if video_base:
+        video_file = io.BytesIO()
+    if audio_base:
+        audio_file = io.BytesIO()
+    
+    if video_base:
+        for i in range(0, len(res)):
+            video_file.write(res[i])
+    if audio_base:
+        for i in range(0, len(res)):
+            audio_file.write(res[i])
+    
+    if video_base and audio_base: return video_file, audio_file
+    if video_base and not audio_base: return video_file, None
+    if audio_base and not video_base: return None, audio_file
 
 def mux_to_file(output, aud, vid):
-    # seek 0: https://github.com/PyAV-Org/PyAV/issues/508#issuecomment-488710828
-    vid.seek(0)
-    aud.seek(0)
-    video = av.open(vid, "r")
-    audio = av.open(aud, "r")
     output = av.open(output, "w")
-    v_in = video.streams.video[0]
-    a_in = audio.streams.audio[0]
 
-    video_p = video.demux(v_in)
-    audio_p = audio.demux(a_in)
-
-    output_video = output.add_stream(template=v_in)
-    output_audio = output.add_stream(template=a_in)
-
-    h_dts = -1
-    for packet in video_p:
-        if packet.dts is None:
-            continue
+    if vid is not None:
+        vid.seek(0)
+        video = av.open(vid, "r")
+        v_in = video.streams.video[0]
+        video_p = video.demux(v_in)
+        output_video = output.add_stream(template=v_in)
         
-        if h_dts == -1:
-            h_dts = packet.dts
+        h_dts = -1
+        for packet in video_p:
+            if packet.dts is None:
+                continue
+            
+            if h_dts == -1:
+                h_dts = packet.dts
 
-        packet.dts = packet.dts - h_dts
-        packet.pts = packet.dts
+            packet.dts = packet.dts - h_dts
+            packet.pts = packet.dts
 
-        packet.stream = output_video
-        output.mux(packet)
+            packet.stream = output_video
+            output.mux(packet)
+        video.close()
+    
+    if aud is not None:
+        aud.seek(0)
+        audio = av.open(aud, "r")
+        a_in = audio.streams.audio[0]
+        audio_p = audio.demux(a_in)
+        output_audio = output.add_stream(template=a_in)
 
-    h_dts = -1
-    for packet in audio_p:
-        if packet.dts is None:
-            continue
+        h_dts = -1
+        for packet in audio_p:
+            if packet.dts is None:
+                continue
 
-        if h_dts == -1:
-            h_dts = packet.dts
+            if h_dts == -1:
+                h_dts = packet.dts
 
-        packet.dts = packet.dts - h_dts
-        packet.pts = packet.dts
+            packet.dts = packet.dts - h_dts
+            packet.pts = packet.dts
 
-        packet.stream = output_audio
-        output.mux(packet)
+            packet.stream = output_audio
+            output.mux(packet)
+        audio.close()
 
     output.close()
-    audio.close()
-    video.close()
 
 def info(a, v, m, s):
     print(f"You can go back {int(m*2/3600)} hours and {int(m*2%3600/60)} minutes...")
@@ -176,6 +192,8 @@ def info(a, v, m, s):
     print("\nVideo stream ids")
     for i in range(len(v)):
         print(f"{i}:  {str(v[i])}")
+    
+    print("\nUse format -1 for no video or audio")
 
 # def download_func(seg):
 #     while True:
@@ -270,8 +288,12 @@ def main(ffmpeg_executable):
     output_path = args.output
 
     if output_path:
-        if not output_path.endswith((".mp4", ".mkv")):
+        formats = (".mp4", ".mkv", ".aac")
+        if not output_path.endswith(formats):
             print("Error: Unsupported output file format!")
+            print("Supported file formats are:")
+            for f in formats:
+                print(f"\t{f}")
             exit(1)
 
     mpd_data = get_mpd_data(url)
@@ -328,7 +350,16 @@ def main(ffmpeg_executable):
                     break
 
     # get video and audio segments asynchronously
-    video, audio = asyncio.get_event_loop().run_until_complete(get_segments(total_segments, v[args.vf].base_url, a[args.af].base_url))
+    if args.vf == -1:
+        video_url = ""
+    else:
+        video_url = v[args.vf].base_url
+    if args.af == -1:
+        audio_url = ""
+    else:
+        audio_url = a[args.af].base_url
+
+    video, audio = asyncio.get_event_loop().run_until_complete(get_segments(total_segments, video_url, audio_url))
     # video = download(v[0], total_segments, 4)
     # audio = download(a[0], total_segments, 4)
     mux_to_file(output_path, audio, video)
