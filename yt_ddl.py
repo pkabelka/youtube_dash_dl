@@ -117,32 +117,91 @@ async def get_segments(total_segments, video_base, audio_base):
                 tasks.append(asyncio.create_task(fetch(session, f"{audio_base}{i}", i, pbar, sem)))
         res = await asyncio.gather(*tasks)
     pbar.close()
-    if video_base:
+    if video_base and not audio_base:
         video_file = io.BytesIO()
-    if audio_base:
-        audio_file = io.BytesIO()
-    
-    if video_base:
         for i in range(0, len(res)):
             video_file.write(res[i])
-    if audio_base:
+        
+    if audio_base and not video_base:
+        audio_file = io.BytesIO()
         for i in range(0, len(res)):
             audio_file.write(res[i])
+
+    if video_base and audio_base:
+        video_file = io.BytesIO()
+        audio_file = io.BytesIO()
+        for i in range(0, len(res), 2):
+            video_file.write(res[i])
+            audio_file.write(res[i+1])
     
     if video_base and audio_base: return video_file, audio_file
     if video_base and not audio_base: return video_file, None
     if audio_base and not video_base: return None, audio_file
 
 def mux_to_file(output, aud, vid):
-    output = av.open(output, "w")
+    if aud is None or vid is None:
+        output = av.open(output, "w")
+        if vid is not None and aud is None:
+            vid.seek(0)
+            video = av.open(vid, "r")
+            v_in = video.streams.video[0]
+            video_p = video.demux(v_in)
+            output_video = output.add_stream(template=v_in)
+            
+            h_dts = -1
+            for packet in video_p:
+                if packet.dts is None:
+                    continue
+                
+                if h_dts == -1:
+                    h_dts = packet.dts
 
-    if vid is not None:
-        vid.seek(0)
-        video = av.open(vid, "r")
-        v_in = video.streams.video[0]
-        video_p = video.demux(v_in)
-        output_video = output.add_stream(template=v_in)
+                packet.dts = packet.dts - h_dts
+                packet.pts = packet.dts
+
+                packet.stream = output_video
+                output.mux(packet)
+            video.close()
         
+        if aud is not None and vid is None:
+            aud.seek(0)
+            audio = av.open(aud, "r")
+            a_in = audio.streams.audio[0]
+            audio_p = audio.demux(a_in)
+            output_audio = output.add_stream(template=a_in)
+
+            h_dts = -1
+            for packet in audio_p:
+                if packet.dts is None:
+                    continue
+
+                if h_dts == -1:
+                    h_dts = packet.dts
+
+                packet.dts = packet.dts - h_dts
+                packet.pts = packet.dts
+
+                packet.stream = output_audio
+                output.mux(packet)
+            audio.close()
+
+        output.close()
+    else:
+        # seek 0: https://github.com/PyAV-Org/PyAV/issues/508#issuecomment-488710828
+        vid.seek(0)
+        aud.seek(0)
+        video = av.open(vid, "r")
+        audio = av.open(aud, "r")
+        output = av.open(output, "w")
+        v_in = video.streams.video[0]
+        a_in = audio.streams.audio[0]
+
+        video_p = video.demux(v_in)
+        audio_p = audio.demux(a_in)
+
+        output_video = output.add_stream(template=v_in)
+        output_audio = output.add_stream(template=a_in)
+
         h_dts = -1
         for packet in video_p:
             if packet.dts is None:
@@ -156,14 +215,6 @@ def mux_to_file(output, aud, vid):
 
             packet.stream = output_video
             output.mux(packet)
-        video.close()
-    
-    if aud is not None:
-        aud.seek(0)
-        audio = av.open(aud, "r")
-        a_in = audio.streams.audio[0]
-        audio_p = audio.demux(a_in)
-        output_audio = output.add_stream(template=a_in)
 
         h_dts = -1
         for packet in audio_p:
@@ -178,9 +229,10 @@ def mux_to_file(output, aud, vid):
 
             packet.stream = output_audio
             output.mux(packet)
-        audio.close()
 
-    output.close()
+        output.close()
+        audio.close()
+        video.close()
 
 def info(a, v, m, s):
     print(f"You can go back {int(m*2/3600)} hours and {int(m*2%3600/60)} minutes...")
