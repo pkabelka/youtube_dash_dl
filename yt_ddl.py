@@ -1,9 +1,6 @@
 import requests
-from bs4 import BeautifulSoup # beautifulsoup4 / lxml
-import urllib.parse #
 import os #
 from mpegdash.parser import MPEGDASHParser # mpegdash
-from datetime import datetime, timezone
 from tqdm import tqdm # tqdm
 import platform
 import shutil
@@ -11,23 +8,14 @@ import re
 import argparse
 import asyncio
 import aiohttp
-import random
 import subprocess
-import multiprocessing
 import io
 from datetime import datetime, timedelta
-from distutils.version import LooseVersion
-# from multiprocessing import cpu_count
-# from multiprocessing.pool import ThreadPool
 
 import time
 import av                                   # av
-import click                                # click
-import pkg_resources                        # setuptools
 from lxml import etree                      # lxml
-from lxml.etree import QName, SubElement    # lxml
-from requests import get                    # requests
-from tqdm import tqdm                       # tqdm
+from lxml.etree import QName                # lxml
 
 s = requests.Session()
 
@@ -323,7 +311,7 @@ def parse_duration(inp):
                 total_seconds += int(chunk[:-1])
         return total_seconds
 
-def main(ffmpeg_executable):
+def main(ffmpeg_executable, ffprobe_executable):
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--output', metavar='OUTPUT_FILE', action='store', help='The output filename')
     parser.add_argument('-s', '--start', metavar='START_TIME', action='store', help='The start time (possible formats = "12:34", "12:34:56", "7.8.2009 12:34:56", "2009-08-07T12:34:56")')
@@ -355,8 +343,23 @@ def main(ffmpeg_executable):
         info(a, v, m, s)
         return
 
+    if args.vf == -1:
+        video_url = ""
+    else:
+        video_url = v[args.vf].base_url
+    if args.af == -1:
+        audio_url = ""
+    else:
+        audio_url = a[args.af].base_url
+
+    result = subprocess.run([ffprobe_executable, "-i", f"{video_url}{m}", "-show_entries", "format=start_time,duration", "-v", "quiet", "-of", "csv=p=0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    seg_start, seg_end = (map(float, result.stdout.rstrip().decode("utf-8").split(",")))
+    seg_len = seg_end - seg_start
+
     start_time = (
-        s - timedelta(seconds=m)
+        s - timedelta(seconds=m * seg_len)
         if args.start == None
         else parse_datetime(args.start, args.utc)
     )
@@ -366,7 +369,7 @@ def main(ffmpeg_executable):
         exit(1)
 
     if args.duration == None and args.end == None:
-        duration = m
+        duration = m * seg_len
     else:
         duration = (
             parse_datetime(args.end, args.utc)
@@ -378,11 +381,11 @@ def main(ffmpeg_executable):
         print("Error: Couldn't parse duration or end date!")
         exit(1)
 
-    start_segment = m - round((s - start_time).total_seconds())
+    start_segment = m - round((s - start_time).total_seconds() / seg_len)
     if start_segment < 0:
         start_segment = 0
 
-    end_segment = start_segment + round(duration)
+    end_segment = start_segment + round(duration / seg_len)
     if end_segment > m:
         print("Error: You are requesting segments that dont exist yet!")
         exit(1)
@@ -402,15 +405,6 @@ def main(ffmpeg_executable):
                     break
 
     # get video and audio segments asynchronously
-    if args.vf == -1:
-        video_url = ""
-    else:
-        video_url = v[args.vf].base_url
-    if args.af == -1:
-        audio_url = ""
-    else:
-        audio_url = a[args.af].base_url
-
     video, audio = asyncio.get_event_loop().run_until_complete(get_segments(total_segments, video_url, audio_url))
     # video = download(v[0], total_segments, 4)
     # audio = download(a[0], total_segments, 4)
@@ -419,16 +413,16 @@ def main(ffmpeg_executable):
 if __name__ == "__main__":
     plt = platform.system()
     if plt == "Windows":
-        if not (os.path.exists("./bin/ffmpeg.exe") or shutil.which("ffmpeg")):
+        if not (os.path.exists("./bin/ffmpeg.exe") or shutil.which("ffmpeg") or os.path.exists("./bin/ffprobeexe") or shutil.which("ffprobe")):
             print("Run 'python download.py' first!")
             exit(1)
-        elif os.path.exists("./bin/ffmpeg.exe"):
-            main(".\\bin\\ffmpeg.exe")
+        elif os.path.exists("./bin/ffmpeg.exe") and os.path.exists("./bin/ffprobe.exe"):
+            main(".\\bin\\ffmpeg.exe", ".\\bin\\ffprobe.exe")
         else:
-            main("ffmpeg")
+            main("ffmpeg", "ffprobe")
     elif plt == "Linux" or plt == "Darwin":
-        if not shutil.which("ffmpeg"):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             print("Install ffmpeg to path!")
             exit(1)
         else:
-            main("ffmpeg")
+            main("ffmpeg", "ffprobe")
