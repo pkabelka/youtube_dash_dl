@@ -356,7 +356,7 @@ def main(ffmpeg_executable):
         return
 
     start_time = (
-        s - timedelta(seconds=m * 2)
+        s - timedelta(seconds=m)
         if args.start == None
         else parse_datetime(args.start, args.utc)
     )
@@ -366,7 +366,7 @@ def main(ffmpeg_executable):
         exit(1)
 
     if args.duration == None and args.end == None:
-        duration = m * 2
+        duration = m
     else:
         duration = (
             parse_datetime(args.end, args.utc)
@@ -378,11 +378,11 @@ def main(ffmpeg_executable):
         print("Error: Couldn't parse duration or end date!")
         exit(1)
 
-    start_segment = m - round((s - start_time).total_seconds() / 2)
+    start_segment = m - round((s - start_time).total_seconds())
     if start_segment < 0:
         start_segment = 0
 
-    end_segment = start_segment + round(duration / 2)
+    end_segment = start_segment + round(duration)
     if end_segment > m:
         print("Error: You are requesting segments that dont exist yet!")
         exit(1)
