@@ -1,10 +1,4 @@
-from requests import get, Session # requests
-import sys #
-from bs4 import BeautifulSoup # beautifulsoup4 / lxml
-import urllib.parse #
-import os #
-from mpegdash.parser import MPEGDASHParser # mpegdash
-from datetime import datetime, timezone
+import os
 from tqdm import tqdm # tqdm
 import platform
 import shutil
@@ -15,6 +9,18 @@ import aiohttp
 import random
 import subprocess
 import multiprocessing
+import time
+from datetime import datetime, timedelta
+
+import requests
+import platform
+import io
+from datetime import datetime, timedelta
+
+from lxml import etree          # lxml
+from lxml.etree import QName    # lxml
+
+s = requests.Session()
 
 async def fetch(session, url, i, folder, pbar, sem):
     async with sem, session.get(url) as response:
@@ -29,8 +35,8 @@ async def get_segments(total_segments, video_base, audio_base, tempdir):
         sem = asyncio.Semaphore(12)
         tasks = []
         for i in total_segments:
-            tasks.append(asyncio.create_task(fetch(session, f"{video_base}/{i}", i, os.path.join(tempdir, "temp-video"), pbar, sem)))
-            tasks.append(asyncio.create_task(fetch(session, f"{audio_base}/{i}", i, os.path.join(tempdir, "temp-audio"), pbar, sem)))
+            tasks.append(asyncio.create_task(fetch(session, f"{video_base}{i}", i, os.path.join(tempdir, "temp-video"), pbar, sem)))
+            tasks.append(asyncio.create_task(fetch(session, f"{audio_base}{i}", i, os.path.join(tempdir, "temp-audio"), pbar, sem)))
         await asyncio.wait(tasks)
     pbar.close()
 
@@ -52,92 +58,121 @@ def process_segments(params):
     proc = subprocess.Popen(cmd_avseg, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
     proc.communicate()
 
+class Stream:
+    def __init__(self, stream_type, bitrate, codec, quality, base_url):
+        self.stream_type = stream_type
+        self.bitrate = bitrate
+        self.codec = codec
+        self.quality = quality
+        self.base_url = base_url
+
+    def __str__(self):
+        return f"{self.quality:{' '}{'>'}{9}} Bitrate: {self.bitrate:{' '}{'>'}{8}} Codec: {self.codec}"
+
+def local_to_utc(dt):
+    if time.localtime().tm_isdst:
+        return dt + timedelta(seconds=time.altzone)
+    else:
+        return dt + timedelta(seconds=time.timezone)
+
+
 def get_mpd_data(video_url):
-    with Session() as s:
-        raw_page = s.get(video_url)
-        soup = BeautifulSoup(raw_page.text, 'lxml')
-        script_obj = str(soup(id="player-wrap")[0].find_all("script")[1]).split("\\\"")
-        for i in range(len(script_obj)):
-            if script_obj[i] == "dashManifestUrl":
-                mpd_url = script_obj[i+2]
-                break
-        mpd_url = urllib.parse.unquote(mpd_url).replace("\/", "/")
-        mpd_file_content = s.get(mpd_url)
-    return mpd_file_content.text
+    page = s.get(video_url).text
+    mpd_link = (
+        page.split('dashManifestUrl\\":\\"')[-1].split('\\"')[0].replace("\/", "/")
+    )
+    return s.get(mpd_link).text
 
-def get_best_representation(mpd_data):
-    best_video = None
-    best_video_res = 0
-    best_audio = None
-    best_audio_sample = 0
-    mpd = MPEGDASHParser.parse(mpd_data)
-    for period in mpd.periods:
-        for adaptationset in period.adaptation_sets:
-            for rep in adaptationset.representations:
-                if rep.height == None:
-                    if int(rep.audio_sampling_rate) >= best_audio_sample:
-                        best_audio = rep
-                        best_audio_sample = int(rep.audio_sampling_rate)
-                else:
-                    if int(rep.height) >= best_video_res:
-                        best_video = rep
-                        best_video_res = int(rep.height)
-    return best_video, best_audio
 
-def parse_datetime(s):
-    def try_strptime(s, fmt):
+def process_mpd(mpd_data):
+    tree = etree.parse(io.BytesIO(mpd_data.encode()))
+    root = tree.getroot()
+    nsmap = {(k or "def"): v for k, v in root.nsmap.items()}
+    time = root.attrib[QName(nsmap["yt"], "mpdResponseTime")]
+    d_time = datetime.strptime(time, "%Y-%m-%dT%H:%M:%S.%f")
+    total_seg = (
+        int(root.attrib[QName(nsmap["yt"], "earliestMediaSequence")])
+        + len(tree.findall(".//def:S", nsmap))
+        - 1
+    )
+    attribute_sets = tree.findall(".//def:Period/def:AdaptationSet", nsmap)
+    v_streams = []
+    a_streams = []
+    for a in attribute_sets:
+        stream_type = a.attrib["mimeType"][0]
+        for r in a.findall(".//def:Representation", nsmap):
+            bitrate = int(r.attrib["bandwidth"])
+            codec = r.attrib["codecs"]
+            base_url = r.find(".//def:BaseURL", nsmap).text + "sq/"
+            if stream_type == "a":
+                quality = r.attrib["audioSamplingRate"]
+                a_streams.append(Stream(stream_type, bitrate, codec, quality, base_url))
+            elif stream_type == "v":
+                quality = f"{r.attrib['width']}x{r.attrib['height']}"
+                v_streams.append(Stream(stream_type, bitrate, codec, quality, base_url))
+    a_streams.sort(key=lambda x: x.bitrate, reverse=True)
+    v_streams.sort(key=lambda x: x.bitrate, reverse=True)
+    return a_streams, v_streams, total_seg, d_time
+
+def info(a, v, m, s):
+    print(f"You can go back {int(m*2/3600)} hours and {int(m*2%3600/60)} minutes...")
+    print(f"Download avaliable from {datetime.today() - timedelta(seconds=m*2)}")
+    print("\nAudio stream ids")
+    for i in range(len(a)):
+        print(f"{i}:  {str(a[i])}")
+
+    print("\nVideo stream ids")
+    for i in range(len(v)):
+        print(f"{i}:  {str(v[i])}")
+    
+    print("\nUse format -1 for no video or audio")
+
+def parse_datetime(inp, utc=True):
+    formats = ["%Y-%m-%dT%H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S", "%d.%m %H:%M:%S", "%H:%M:%S"]
+    for fmt in formats:
         try:
-            return datetime.strptime(s, fmt)
+            d_time = datetime.strptime(inp, fmt)
+            today = datetime.today()
+            if not ('d' in fmt):
+                d_time = d_time.replace(year=today.year, month=today.month,day=today.day)
+            if not ('Y' in fmt):
+                d_time = d_time.replace(year=today.year)
+            if utc:
+                return d_time
+            return local_to_utc(d_time)
         except ValueError:
-            return None
-    dt = try_strptime(s, '%H:%M')
-    if dt:
-        today = datetime.today()
-        return dt.replace(year=today.year, month=today.month, day=today.day)
-    dt = try_strptime(s, '%H:%M:%S')
-    if dt:
-        today = datetime.today()
-        return dt.replace(year=today.year, month=today.month, day=today.day)
-    dt = try_strptime(s, '%d.%m %H:%M')
-    if dt:
-        return dt.replace(year=datetime.today().year)
-    dt = try_strptime(s, '%d.%m.%Y %H:%M')
-    if dt:
-        return dt
-    dt = try_strptime(s, '%d.%m %H:%M:%S')
-    if dt:
-        return dt.replace(year=datetime.today().year)
-    dt = try_strptime(s, '%d.%m.%Y %H:%M:%S')
-    if dt:
-        return dt
-    dt = try_strptime(s, '%Y-%m-%dT%H:%M:%S')
-    if dt:
-        return dt
-    return None
+            pass
+    return -1
 
-def parse_duration(s):
-    m = re.match(r'^((?P<h>\d+)h)?((?P<m>\d+)m)?((?P<s>\d+)s)?$', s)
-    if not m:
-        return None
-    h, m, s = m.groupdict().values()
-    if not h and not m and not s:
-        return None
-    secs = 0
-    if h:
-        secs += int(h) * 3600
-    if m:
-        secs += int(m) * 60
-    if s:
-        secs += int(s)
-    return secs
+def parse_duration(inp):
+    x = re.findall("([0-9]+[hmsHMS])", inp)
+    if len(x) == 0:
+        try:
+            number = int(inp)
+        except:
+            return -1
+        return number
+    else:
+        total_seconds = 0
+        for chunk in x:
+            if chunk[-1] == "h":
+                total_seconds += int(chunk[:-1]) * 3600
+            elif chunk[-1] == "m":
+                total_seconds += int(chunk[:-1]) * 60
+            elif chunk[-1] == "s":
+                total_seconds += int(chunk[:-1])
+        return total_seconds
 
-def main(ffmpeg_executable):
+def main(ffmpeg_executable, ffprobe_executable):
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--output', metavar='OUTPUT_FILE', action='store', help='The output filename')
     parser.add_argument('-s', '--start', metavar='START_TIME', action='store', help='The start time (possible formats = "12:34", "12:34:56", "7.8.2009 12:34:56", "2009-08-07T12:34:56")')
     parser.add_argument('-e', '--end', metavar='END_TIME', action='store', help='The end time (same format as start time)')
     parser.add_argument('-d', '--duration', action='store', help='The duration (possible formats = "12h34m56s", "12m34s", "123s", "123m", "123h", ...)')
     parser.add_argument('-u', '--utc', action='store_true', help='Use UTC instead of local time for start and end time', default=False)
+    parser.add_argument('-l', '--list-formats', action='store_true', help='List info about stream ids', default=False)
+    parser.add_argument('-af', action='store', help='Select audio stream id', type=int, default=0)
+    parser.add_argument('-vf', action='store', help='Select video stream id', type=int, default=0)
     parser.add_argument('-y', '--overwrite', action='store_true', help='Overwrite file without asking', default=False)
     parser.add_argument('url', metavar='URL', action='store', help='The URL of the YouTube stream')
     args = parser.parse_args()
@@ -146,46 +181,71 @@ def main(ffmpeg_executable):
     start_time = None
     duration_secs = None
 
-    def arg_fail(message):
-        print(message, file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
+    if output_path:
+        formats = (".mp4", ".mkv", ".aac")
+        if not output_path.endswith(formats):
+            print("Error: Unsupported output file format!")
+            print("Supported file formats are:")
+            for f in formats:
+                print(f"\t{f}")
+            exit(1)
 
-    if args.start:
-        start_time = parse_datetime(args.start)
-        if not start_time:
-            arg_fail('Invalid start time format')
-        start_time = start_time.replace(tzinfo=timezone.utc if args.utc else None).astimezone()
+    mpd_data = get_mpd_data(url)
+    a, v, m, s = process_mpd(mpd_data)
 
-    if args.duration and args.end:
-        arg_fail('Specify end time or duration, not both')
+    if args.list_formats == True:
+        info(a, v, m, s)
+        return
 
-    if args.duration:
-        duration_secs = parse_duration(args.duration)
-        if not duration_secs:
-            arg_fail('Invalid duration format')
-        if duration_secs == 0:
-            arg_fail('Duration cannot be 0')
+    # if args.vf == -1:
+    #     video_url = ""
+    # else:
+    #     video_url = v[args.vf].base_url
+    # if args.af == -1:
+    #     audio_url = ""
+    # else:
+    #     audio_url = a[args.af].base_url
+    video_url = v[args.vf].base_url
+    audio_url = a[args.af].base_url
 
-    if args.end:
-        end_time = parse_datetime(args.end)
-        if not end_time:
-            arg_fail('Invalid end time format!')
-        end_time = end_time.replace(tzinfo=timezone.utc if args.utc else None).astimezone()
-        duration_secs = (end_time - start_time).total_seconds()
-        if duration_secs == 0:
-            arg_fail('Duration cannot be 0')
+    result = subprocess.run([ffprobe_executable, "-i", f"{video_url}/{m}", "-show_entries", "format=start_time,duration", "-v", "quiet", "-of", "csv=p=0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    seg_start, seg_end = (map(float, result.stdout.rstrip().decode("utf-8").split(",")))
+    seg_len = seg_end - seg_start
 
-    data = get_mpd_data(url)
-    video, audio = get_best_representation(data)
+    start_time = (
+        s - timedelta(seconds=m * seg_len)
+        if args.start == None
+        else parse_datetime(args.start, args.utc)
+    )
 
-    video_base = video.base_urls[0].base_url_value + "/".join(video.segment_lists[0].segment_urls[0].media.split('/')[:-3])
-    audio_base = audio.base_urls[0].base_url_value + "/".join(audio.segment_lists[0].segment_urls[0].media.split('/')[:-3])
-    max_seg = int(video.segment_lists[0].segment_urls[-1].media.split('/')[-3])
+    if start_time == -1:
+        print("Error: Couldn't parse start date!")
+        exit(1)
 
-    if not output_path:
-        print(f"You can go back {int(max_seg*2/60/60)} hours and {int(max_seg*2/60%60)} minutes back...")
-        exit(0)
+    if args.duration == None and args.end == None:
+        duration = m * seg_len
+    else:
+        duration = (
+            parse_datetime(args.end, args.utc)
+            if args.duration == None
+            else parse_duration(args.duration)
+        )
+
+    if duration == -1:
+        print("Error: Couldn't parse duration or end date!")
+        exit(1)
+
+    start_segment = m - round((s - start_time).total_seconds() / seg_len)
+    if start_segment < 0:
+        start_segment = 0
+
+    end_segment = start_segment + round(duration / seg_len)
+    if end_segment > m:
+        print("Error: You are requesting segments that dont exist yet!")
+        exit(1)
+    total_segments = range(start_segment, end_segment)
 
     if os.path.exists(output_path):
         if args.overwrite:
@@ -195,21 +255,10 @@ def main(ffmpeg_executable):
                 print(f'File "{output_path}" already exists! Overwrite? [y/N] ', end='')
                 yn = input().lower()
                 if yn == '' or yn == 'n':
-                    sys.exit(0)
+                    exit(0)
                 else:
                     os.remove(output_path)
                     break
-
-    if start_time:
-        req_time = datetime.strptime(data.split("yt:mpdRequestTime=\"")[-1].split("\"")[0], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc).astimezone()
-        segments_back = round((req_time - start_time).total_seconds() / 2)
-        segments_back = segments_back if segments_back < max_seg else max_seg
-        dur_segments = round(duration_secs / 2)
-        start_segment = max_seg - segments_back
-        end_segment = start_segment + dur_segments
-        total_segments = range(start_segment, end_segment)
-    else:
-        total_segments = range(max_seg)
 
     # make a temporary directory in the output file's directory
     tempdir_parent = os.path.dirname(os.path.abspath(os.path.realpath(output_path)))
@@ -223,7 +272,7 @@ def main(ffmpeg_executable):
     os.mkdir(os.path.join(tempdir, "temp-audio"))
 
     # get video and audio segments asynchronously
-    asyncio.get_event_loop().run_until_complete(get_segments(total_segments, video_base, audio_base, tempdir))
+    asyncio.get_event_loop().run_until_complete(get_segments(total_segments, video_url, audio_url, tempdir))
 
     # merge video and audio segments each into its file
     os.mkdir(os.path.join(tempdir, "avseg"))
@@ -274,16 +323,16 @@ def main(ffmpeg_executable):
 if __name__ == "__main__":
     plt = platform.system()
     if plt == "Windows":
-        if not (os.path.exists("./bin/ffmpeg.exe") or shutil.which("ffmpeg")):
+        if not (os.path.exists("./bin/ffmpeg.exe") or shutil.which("ffmpeg") or os.path.exists("./bin/ffprobeexe") or shutil.which("ffprobe")):
             print("Run 'python download.py' first!")
             exit(1)
-        elif os.path.exists("./bin/ffmpeg.exe"):
-            main(".\\bin\\ffmpeg.exe")
+        elif os.path.exists("./bin/ffmpeg.exe") and os.path.exists("./bin/ffprobe.exe"):
+            main(".\\bin\\ffmpeg.exe", ".\\bin\\ffprobe.exe")
         else:
-            main("ffmpeg")
+            main("ffmpeg", "ffprobe")
     elif plt == "Linux" or plt == "Darwin":
-        if not shutil.which("ffmpeg"):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             print("Install ffmpeg to path!")
             exit(1)
         else:
-            main("ffmpeg")
+            main("ffmpeg", "ffprobe")
