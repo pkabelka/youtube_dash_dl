@@ -1,6 +1,5 @@
 import requests
 import os #
-from mpegdash.parser import MPEGDASHParser # mpegdash
 from tqdm import tqdm # tqdm
 import platform
 import shutil
@@ -255,25 +254,6 @@ def info(a, v, m, s):
 #         combined_file.write(res)
 
 #     return combined_file
-
-def get_best_representation(mpd_data):
-    best_video = None
-    best_video_res = 0
-    best_audio = None
-    best_audio_sample = 0
-    mpd = MPEGDASHParser.parse(mpd_data)
-    for period in mpd.periods:
-        for adaptationset in period.adaptation_sets:
-            for rep in adaptationset.representations:
-                if rep.height == None:
-                    if int(rep.audio_sampling_rate) >= best_audio_sample:
-                        best_audio = rep
-                        best_audio_sample = int(rep.audio_sampling_rate)
-                else:
-                    if int(rep.height) >= best_video_res:
-                        best_video = rep
-                        best_video_res = int(rep.height)
-    return best_video, best_audio
 
 def parse_datetime(inp, utc=True):
     formats = ["%Y-%m-%dT%H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S", "%d.%m %H:%M:%S", "%H:%M:%S"]
