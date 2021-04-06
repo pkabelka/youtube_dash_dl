@@ -19,6 +19,8 @@ import lxml.html                            # lxml
 
 s = requests.Session()
 
+av.logging.set_level(av.logging.PANIC)
+
 class Stream:
     def __init__(self, stream_type, bitrate, codec, quality, base_url):
         self.stream_type = stream_type
