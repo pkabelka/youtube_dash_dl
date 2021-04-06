@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 
 from lxml import etree          # lxml
 from lxml.etree import QName    # lxml
+import lxml.html                # lxml
 
 s = requests.Session()
 
@@ -77,12 +78,22 @@ def local_to_utc(dt):
 
 
 def get_mpd_data(video_url):
-    page = s.get(video_url).text
-    if 'dashManifestUrl\\":\\"' in page:
-        mpd_link = page.split('dashManifestUrl\\":\\"')[-1].split('\\"')[0].replace("\/", "/")
-    elif 'dashManifestUrl":"' in page:
-        mpd_link = page.split('dashManifestUrl":"')[-1].split('"')[0].replace("\/", "/")
+    req = s.get(video_url)
+    if 'dashManifestUrl\\":\\"' in req.text:
+        mpd_link = req.text.split('dashManifestUrl\\":\\"')[-1].split('\\"')[0].replace("\/", "/")
+    elif 'dashManifestUrl":"' in req.text:
+        mpd_link = req.text.split('dashManifestUrl":"')[-1].split('"')[0].replace("\/", "/")
     else:
+        doc = lxml.html.fromstring(req.content)
+        form = doc.xpath('//form[@action="https://consent.youtube.com/s"]')
+        if len(form) > 0:
+            print("Consent check detected. Will try to pass...")
+            params = form[0].xpath('.//input[@type="hidden"]')
+            pars = {}
+            for par in params:
+                pars[par.attrib['name']] = par.attrib['value']
+            s.post("https://consent.youtube.com/s", data=pars)
+            return get_mpd_data(video_url)
         return None
     return s.get(mpd_link).text
 
